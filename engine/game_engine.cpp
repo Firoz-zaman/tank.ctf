@@ -1,8 +1,9 @@
 /*
- * game_engine.cpp — 2D Tank CTF Game Engine (v3 — Lobby, Timer, Kills)
+ * game_engine.cpp — 2D Tank CTF Game Engine (v4)
  *
  * Game phases: LOBBY → COUNTDOWN → PLAYING → GAMEOVER → (restart) → LOBBY
- * Features: 4-team, configurable bounces, game timer, kill tracking
+ * Features: 2/3/4-team config, fill-empty-teams-first, emotes, configurable bounces,
+ *           game timer, kill tracking, separated wall serialization
  */
 
 #include "game_engine.h"
@@ -185,14 +186,19 @@ static void spawn_bullet(int player_id, float angle) {
 
 /* ─── Team helpers ─── */
 
-static void recalc_teams() {
-    int has[MAX_TEAMS] = {0};
+static void update_team_has_players() {
+    for (int i = 0; i < MAX_TEAMS; i++) g_state.team_has_players[i] = 0;
     for (int i = 0; i < MAX_PLAYERS; i++)
-        if (g_state.tanks[i].active) has[g_state.tanks[i].team] = 1;
-    int count = 0;
-    for (int i = 0; i < MAX_TEAMS; i++) count += has[i];
-    if (count < 2) count = 2;
-    g_state.num_teams = count;
+        if (g_state.tanks[i].active) g_state.team_has_players[g_state.tanks[i].team] = 1;
+}
+
+static void recalc_teams() {
+    update_team_has_players();
+    /* num_teams = configured_teams, but at least count of occupied teams */
+    int occupied = 0;
+    for (int i = 0; i < MAX_TEAMS; i++) occupied += g_state.team_has_players[i];
+    g_state.num_teams = (g_state.configured_teams > occupied) ? g_state.configured_teams : occupied;
+    if (g_state.num_teams < 2) g_state.num_teams = 2;
 }
 
 static void setup_flags() {
@@ -229,6 +235,7 @@ void engine_init(void) {
     memset(&g_state, 0, sizeof(g_state));
     g_state.winner_team = -1;
     g_state.num_teams = 2;
+    g_state.configured_teams = 2;
     g_state.phase = PHASE_LOBBY;
     g_state.max_bounces = DEFAULT_MAX_BOUNCES;
     g_state.game_duration = 0; /* unlimited by default */
@@ -239,6 +246,8 @@ void engine_init(void) {
         g_state.tanks[i].id = i;
         g_state.tanks[i].active = 0;
         g_state.tanks[i].carrying_flag = -1;
+        g_state.tanks[i].emote = EMOTE_NONE;
+        g_state.tanks[i].emote_timer = 0;
     }
     for (int i = 0; i < MAX_BULLETS; i++) g_state.bullets[i].active = 0;
 
@@ -253,6 +262,7 @@ void engine_init(void) {
         g_state.flags[i].team = i;
         g_state.flags[i].carried = 0;
         g_state.flags[i].carrier_id = -1;
+        g_state.team_has_players[i] = 0;
     }
 }
 
@@ -264,19 +274,26 @@ int engine_add_player(void) {
         if (!g_state.tanks[i].active) { slot = i; break; }
     if (slot < 0) return -1;
 
-    /* Balanced team assignment */
+    int nt = g_state.configured_teams;
+
+    /* Count players per team */
     int team_counts[MAX_TEAMS] = {0};
     for (int i = 0; i < MAX_PLAYERS; i++)
         if (g_state.tanks[i].active) team_counts[g_state.tanks[i].team]++;
 
-    int total = g_state.player_count + 1;
-    int num_teams = 2;
-    if (total > 6) num_teams = 4;
-    else if (total > 4) num_teams = 3;
-
-    int best_team = 0, min_count = team_counts[0];
-    for (int t = 1; t < num_teams; t++)
-        if (team_counts[t] < min_count) { min_count = team_counts[t]; best_team = t; }
+    /* Fill empty teams first, then pick the team with fewest players */
+    int best_team = -1;
+    for (int t = 0; t < nt; t++) {
+        if (team_counts[t] == 0) { best_team = t; break; }
+    }
+    if (best_team < 0) {
+        /* All teams have at least 1 player — pick smallest */
+        best_team = 0;
+        int min_count = team_counts[0];
+        for (int t = 1; t < nt; t++) {
+            if (team_counts[t] < min_count) { min_count = team_counts[t]; best_team = t; }
+        }
+    }
 
     Tank& t = g_state.tanks[slot];
     t.active = 1;
@@ -285,6 +302,8 @@ int engine_add_player(void) {
     t.respawn_timer = 0;
     t.carrying_flag = -1;
     t.kills = 0;
+    t.emote = EMOTE_NONE;
+    t.emote_timer = 0;
     t.angle = spawn_angle[t.team];
     t.turret_angle = t.angle;
     t.x = base_x[t.team] + (slot % 2 == 0 ? -15.0f : 15.0f);
@@ -294,7 +313,7 @@ int engine_add_player(void) {
     t.input_turret_angle = t.turret_angle;
 
     g_state.player_count++;
-    g_state.num_teams = num_teams;
+    recalc_teams();
     return slot;
 }
 
@@ -335,6 +354,24 @@ void engine_set_config(int max_bounces, float game_duration) {
     if (game_duration >= 0) g_state.game_duration = game_duration;
 }
 
+void engine_set_team_count(int count) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (count < 2) count = 2;
+    if (count > 4) count = 4;
+    g_state.configured_teams = count;
+    recalc_teams();
+}
+
+void engine_set_emote(int player_id, int emote) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (player_id < 0 || player_id >= MAX_PLAYERS) return;
+    Tank& t = g_state.tanks[player_id];
+    if (!t.active || !t.alive) return;
+    if (emote < EMOTE_NONE || emote > EMOTE_SAD) return;
+    t.emote = emote;
+    t.emote_timer = (emote != EMOTE_NONE) ? EMOTE_DURATION : 0;
+}
+
 void engine_start_game(void) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_state.phase != PHASE_LOBBY) return;
@@ -355,6 +392,8 @@ void engine_start_game(void) {
         Tank& t = g_state.tanks[i];
         if (!t.active) continue;
         t.kills = 0;
+        t.emote = EMOTE_NONE;
+        t.emote_timer = 0;
         respawn_tank(i);
     }
 
@@ -397,12 +436,17 @@ void engine_restart(void) {
         if (!t.active) continue;
         t.kills = 0;
         t.carrying_flag = -1;
+        t.emote = EMOTE_NONE;
+        t.emote_timer = 0;
         respawn_tank(i);
     }
 }
 
 void engine_tick(float dt) {
     std::lock_guard<std::mutex> lock(g_mutex);
+
+    /* Always update team_has_players */
+    update_team_has_players();
 
     /* ─── LOBBY: do nothing, wait for start_game ─── */
     if (g_state.phase == PHASE_LOBBY) return;
@@ -446,6 +490,15 @@ void engine_tick(float dt) {
     for (int i = 0; i < MAX_PLAYERS; i++) {
         Tank& t = g_state.tanks[i];
         if (!t.active) continue;
+
+        /* Tick emote timer */
+        if (t.emote != EMOTE_NONE) {
+            t.emote_timer -= dt;
+            if (t.emote_timer <= 0) {
+                t.emote = EMOTE_NONE;
+                t.emote_timer = 0;
+            }
+        }
 
         if (!t.alive) {
             t.respawn_timer -= dt;
@@ -579,6 +632,19 @@ void engine_tick(float dt) {
     off += snprintf(buf + off, buf_size - off, fmt, ##__VA_ARGS__); \
 } while(0)
 
+int engine_get_walls(char* buf, int buf_size) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    int off = 0;
+    W("[");
+    for (int i = 0; i < g_state.wall_count; i++) {
+        Wall& w = g_state.walls[i];
+        if (i > 0) W(",");
+        W("[%.0f,%.0f,%.0f,%.0f]", w.x, w.y, w.w, w.h);
+    }
+    W("]");
+    return off;
+}
+
 int engine_get_state(char* buf, int buf_size) {
     std::lock_guard<std::mutex> lock(g_mutex);
     int off = 0;
@@ -591,26 +657,21 @@ int engine_get_state(char* buf, int buf_size) {
     W("\"timer\":%.1f,", g_state.game_timer);
     W("\"duration\":%.0f,", g_state.game_duration);
     W("\"max_bounces\":%d,", g_state.max_bounces);
+    W("\"configured_teams\":%d,", g_state.configured_teams);
 
     /* Meta */
     W("\"scores\":[%d,%d,%d,%d],", g_state.scores[0], g_state.scores[1],
       g_state.scores[2], g_state.scores[3]);
     W("\"team_kills\":[%d,%d,%d,%d],", g_state.team_kills[0], g_state.team_kills[1],
       g_state.team_kills[2], g_state.team_kills[3]);
+    W("\"team_has_players\":[%d,%d,%d,%d],",
+      g_state.team_has_players[0], g_state.team_has_players[1],
+      g_state.team_has_players[2], g_state.team_has_players[3]);
     W("\"num_teams\":%d,", g_state.num_teams);
     W("\"player_count\":%d,", g_state.player_count);
     W("\"winner\":%d,\"win_reason\":%d,", g_state.winner_team, g_state.win_reason);
 
-    /* Walls */
-    W("\"walls\":[");
-    for (int i = 0; i < g_state.wall_count; i++) {
-        Wall& w = g_state.walls[i];
-        if (i > 0) W(",");
-        W("[%.0f,%.0f,%.0f,%.0f]", w.x, w.y, w.w, w.h);
-    }
-    W("],");
-
-    /* Flags */
+    /* Flags (only existing) */
     W("\"flags\":[");
     int ff = 1;
     for (int i = 0; i < MAX_TEAMS; i++) {
@@ -623,7 +684,7 @@ int engine_get_state(char* buf, int buf_size) {
     }
     W("],");
 
-    /* Tanks */
+    /* Tanks (only active) */
     W("\"tanks\":[");
     int ft = 1;
     for (int i = 0; i < MAX_PLAYERS; i++) {
@@ -633,14 +694,16 @@ int engine_get_state(char* buf, int buf_size) {
         ft = 0;
         W("{\"id\":%d,\"team\":%d,\"x\":%.1f,\"y\":%.1f,"
           "\"angle\":%.3f,\"turret\":%.3f,"
-          "\"alive\":%d,\"flag\":%d,\"kills\":%d}",
+          "\"alive\":%d,\"flag\":%d,\"kills\":%d,"
+          "\"emote\":%d,\"emote_t\":%.1f}",
           t.id, t.team, t.x, t.y,
           t.angle, t.turret_angle,
-          t.alive, t.carrying_flag, t.kills);
+          t.alive, t.carrying_flag, t.kills,
+          t.emote, t.emote_timer);
     }
     W("],");
 
-    /* Bullets */
+    /* Bullets (only active) */
     W("\"bullets\":[");
     int fb2 = 1;
     for (int i = 0; i < MAX_BULLETS; i++) {

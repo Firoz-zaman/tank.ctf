@@ -1,8 +1,10 @@
 """
-Tank CTF — Python WebSocket game server (v3 — Lobby, Timer, Share Link)
+Tank CTF — Python WebSocket game server (v4)
 
 Loads the C++ game engine via ctypes, manages lobby, relays settings,
 and bridges WebSocket clients to the engine. Serves static web files.
+
+Walls are sent once on connect (not per tick) for efficiency.
 
 Usage:
     python server.py
@@ -63,6 +65,9 @@ lib.engine_tick.restype = None
 lib.engine_get_state.argtypes = [ctypes.c_char_p, ctypes.c_int]
 lib.engine_get_state.restype = ctypes.c_int
 
+lib.engine_get_walls.argtypes = [ctypes.c_char_p, ctypes.c_int]
+lib.engine_get_walls.restype = ctypes.c_int
+
 lib.engine_get_player_team.argtypes = [ctypes.c_int]
 lib.engine_get_player_team.restype = ctypes.c_int
 
@@ -71,6 +76,12 @@ lib.engine_get_num_teams.restype = ctypes.c_int
 
 lib.engine_set_config.argtypes = [ctypes.c_int, ctypes.c_float]
 lib.engine_set_config.restype = None
+
+lib.engine_set_team_count.argtypes = [ctypes.c_int]
+lib.engine_set_team_count.restype = None
+
+lib.engine_set_emote.argtypes = [ctypes.c_int, ctypes.c_int]
+lib.engine_set_emote.restype = None
 
 lib.engine_start_game.argtypes = []
 lib.engine_start_game.restype = None
@@ -84,11 +95,21 @@ TEAM_NAMES = ['Red', 'Blue', 'Green', 'Yellow']
 
 STATE_BUF_SIZE = 1024 * 64
 state_buf = ctypes.create_string_buffer(STATE_BUF_SIZE)
+walls_buf = ctypes.create_string_buffer(STATE_BUF_SIZE)
 
 players = {}       # websocket -> player_id
 TICK_RATE = 60
 PORT_WS = 8765
 PORT_HTTP = 8080
+
+# Cache walls JSON (only changes on init)
+cached_walls_json = None
+
+def get_walls_json():
+    global cached_walls_json
+    length = lib.engine_get_walls(walls_buf, STATE_BUF_SIZE)
+    cached_walls_json = walls_buf.value[:length].decode("utf-8")
+    return cached_walls_json
 
 # ─── HTTP Server ─────────────────────────────────────────────────────────────
 
@@ -116,6 +137,7 @@ async def handle_client(websocket):
     num_teams = lib.engine_get_num_teams()
     players[websocket] = player_id
 
+    # Send welcome with walls (walls sent once, not per tick)
     await websocket.send(json.dumps({
         "type": "welcome",
         "id": player_id,
@@ -123,6 +145,7 @@ async def handle_client(websocket):
         "num_teams": num_teams,
         "server_ip": local_ip,
         "port": PORT_HTTP,
+        "walls": json.loads(cached_walls_json),
     }))
 
     tname = TEAM_NAMES[team] if team < len(TEAM_NAMES) else str(team)
@@ -147,8 +170,11 @@ async def handle_client(websocket):
                     int(data.get("shoot", 0)),
                     ctypes.c_float(float(data.get("turret", 0.0))),
                 )
+            elif msg_type == "emote":
+                emote = int(data.get("emote", 0))
+                lib.engine_set_emote(player_id, emote)
+
             elif msg_type == "start":
-                # Any player can start (when 2+ players present)
                 lib.engine_start_game()
                 print("  ▶ Game started!")
 
@@ -160,7 +186,12 @@ async def handle_client(websocket):
                 bounces = int(data.get("bounces", 8))
                 duration = float(data.get("duration", 0))
                 lib.engine_set_config(bounces, ctypes.c_float(duration))
-                print(f"  ⚙ Config: bounces={bounces}, duration={duration}s")
+                if "team_count" in data:
+                    tc = int(data["team_count"])
+                    lib.engine_set_team_count(tc)
+                    print(f"  ⚙ Config: bounces={bounces}, duration={duration}s, teams={tc}")
+                else:
+                    print(f"  ⚙ Config: bounces={bounces}, duration={duration}s")
 
     except websockets.exceptions.ConnectionClosed:
         pass
@@ -215,6 +246,7 @@ async def main():
     print("=" * 58)
 
     lib.engine_init()
+    get_walls_json()  # Cache walls
     print("  ✓ C++ game engine initialized")
 
     start_http_server()

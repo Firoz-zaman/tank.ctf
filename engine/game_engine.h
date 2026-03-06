@@ -32,6 +32,12 @@ extern "C" {
 #define PHASE_PLAYING   2
 #define PHASE_GAMEOVER  3
 
+/* Emotes */
+#define EMOTE_NONE      0
+#define EMOTE_HAPPY     1
+#define EMOTE_SAD       2
+#define EMOTE_DURATION  3.0f
+
 /* ─── Structs ─── */
 
 typedef struct {
@@ -67,6 +73,8 @@ typedef struct {
     float respawn_timer;
     int   carrying_flag;    /* -1 = none, 0-3 = flag team index */
     int   kills;            /* kill count */
+    int   emote;            /* EMOTE_NONE / HAPPY / SAD */
+    float emote_timer;      /* seconds remaining for emote display */
 
     /* input state */
     int   input_up, input_down, input_left, input_right;
@@ -80,10 +88,12 @@ typedef struct {
     Wall   walls[MAX_WALLS];
     Flag   flags[MAX_TEAMS];
     int    scores[MAX_TEAMS];
-    int    team_kills[MAX_TEAMS];   /* total kills per team */
+    int    team_kills[MAX_TEAMS];       /* total kills per team */
+    int    team_has_players[MAX_TEAMS]; /* 1 if any active tank on team */
     int    wall_count;
     int    player_count;
     int    num_teams;
+    int    configured_teams;            /* user-selected: 2, 3, or 4 */
 
     /* Game flow */
     int    phase;               /* PHASE_LOBBY / COUNTDOWN / PLAYING / GAMEOVER */
@@ -106,11 +116,14 @@ void engine_set_input(int player_id,
                       int shoot, float turret_angle);
 void engine_tick(float dt);
 int  engine_get_state(char* buf, int buf_size);
+int  engine_get_walls(char* buf, int buf_size);
 int  engine_get_player_team(int player_id);
 int  engine_get_num_teams(void);
 
 /* Game flow */
 void engine_set_config(int max_bounces, float game_duration);
+void engine_set_team_count(int count);   /* set configured team count 2/3/4 */
+void engine_set_emote(int player_id, int emote);
 void engine_start_game(void);    /* lobby → countdown → playing */
 void engine_restart(void);       /* gameover → lobby */
 

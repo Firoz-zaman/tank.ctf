@@ -1,10 +1,16 @@
 /**
- * Tank CTF — Web Game Client (v3 — Lobby, Game Flow, Timer, Kills)
+ * Tank CTF — Web Game Client (v4 — Engine-driven, Emotes, Efficiency)
  *
  * Connects to the Python WebSocket server, captures input,
  * renders the game on HTML5 Canvas with neon/glassmorphism aesthetic.
  *
- * Game flow: Menu → Connect → Lobby → Countdown → Playing → Game Over → Lobby
+ * v4 changes:
+ *  - Walls received once on connect, cached + pre-rendered to offscreen canvas
+ *  - Grid pre-rendered to offscreen canvas
+ *  - Team count selector (2/3/4)
+ *  - HUD only shows teams with players  
+ *  - Emote system: G=happy, H=sad (rendered above tanks)
+ *  - Fill-empty-teams-first assignment (engine-side)
  */
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -18,6 +24,11 @@ const PHASE_LOBBY = 0;
 const PHASE_COUNTDOWN = 1;
 const PHASE_PLAYING = 2;
 const PHASE_GAMEOVER = 3;
+
+const EMOTE_NONE = 0;
+const EMOTE_HAPPY = 1;
+const EMOTE_SAD = 2;
+const EMOTE_EMOJI = { [EMOTE_HAPPY]: '😄', [EMOTE_SAD]: '😢' };
 
 // 4-team color palette
 const TEAMS = [
@@ -33,7 +44,6 @@ const COL = {
     wallFill: '#161d2e',
     wallTop: '#1f2940',
     wallStroke: '#2a3858',
-    wallGlow: 'rgba(80, 140, 255, 0.04)',
     turret: '#c8d0e0',
     turretTip: '#e8f0ff',
 };
@@ -49,7 +59,10 @@ let prevState = null;
 let connected = false;
 let serverIp = '';
 let serverPort = 8080;
-let currentPhase = -1;  // Track phase transitions
+let currentPhase = -1;
+
+// Cached walls (received once)
+let cachedWalls = [];
 
 // Input
 const keys = { up: false, down: false, left: false, right: false };
@@ -61,6 +74,11 @@ let canvas, ctx;
 let scale = 1;
 let offsetX = 0, offsetY = 0;
 
+// Pre-rendered offscreen canvases
+let gridCanvas = null;
+let wallCanvas = null;
+let offscreenDirty = true;
+
 // Particles / effects
 let particles = [];
 let bulletTrails = [];
@@ -69,8 +87,11 @@ let ambientParticles = [];
 let screenShake = { x: 0, y: 0, intensity: 0 };
 let time = 0;
 
-// Previous bullet state for detecting deaths/impacts
-let prevBulletCount = 0;
+// Bullet trail ring buffer (efficiency)
+const MAX_TRAILS = 300;
+let trailHead = 0;
+let trailPool = [];
+for (let i = 0; i < MAX_TRAILS; i++) trailPool.push({ x: 0, y: 0, team: 0, life: 0 });
 
 // ─── Ambient particle system ────────────────────────────────────────────────
 
@@ -131,6 +152,11 @@ function connectToServer() {
             numTeams = msg.num_teams || 2;
             serverIp = msg.server_ip || window.location.hostname;
             serverPort = msg.port || 8080;
+            // Cache walls from welcome (sent once, not per tick)
+            if (msg.walls) {
+                cachedWalls = msg.walls;
+                offscreenDirty = true;
+            }
             connected = true;
             showLobby();
         } else if (msg.type === 'state') {
@@ -197,9 +223,11 @@ function showLobby() {
         });
 
         const durationSelect = document.getElementById('setting-duration');
-        durationSelect.addEventListener('change', () => {
-            sendConfig();
-        });
+        durationSelect.addEventListener('change', () => sendConfig());
+
+        // Team count radio buttons
+        const tcRadios = document.querySelectorAll('input[name="team-count"]');
+        tcRadios.forEach(r => r.addEventListener('change', () => sendConfig()));
 
         lobbyInitialized = true;
     }
@@ -209,7 +237,8 @@ function sendConfig() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const bounces = parseInt(document.getElementById('setting-bounces').value);
     const duration = parseFloat(document.getElementById('setting-duration').value);
-    ws.send(JSON.stringify({ type: 'config', bounces, duration }));
+    const teamCount = parseInt(document.querySelector('input[name="team-count"]:checked').value);
+    ws.send(JSON.stringify({ type: 'config', bounces, duration, team_count: teamCount }));
 }
 
 function startGame() {
@@ -270,14 +299,18 @@ function updateLobby() {
     }
     if (gameState.duration !== undefined) {
         const select = document.getElementById('setting-duration');
-        const dur = gameState.duration;
-        // Find closest option
         for (const opt of select.options) {
-            if (parseFloat(opt.value) === dur) {
+            if (parseFloat(opt.value) === gameState.duration) {
                 select.value = opt.value;
                 break;
             }
         }
+    }
+    if (gameState.configured_teams !== undefined) {
+        const tcRadios = document.querySelectorAll('input[name="team-count"]');
+        tcRadios.forEach(r => {
+            r.checked = parseInt(r.value) === gameState.configured_teams;
+        });
     }
 }
 
@@ -290,7 +323,6 @@ function handlePhaseChange() {
     const phase = gameState.phase;
 
     if (phase === PHASE_LOBBY) {
-        // Show lobby
         if (currentPhase !== PHASE_LOBBY) {
             showLobby();
             document.getElementById('gameover-overlay').style.display = 'none';
@@ -307,7 +339,7 @@ function handlePhaseChange() {
         canvas = document.getElementById('game-canvas');
         ctx = canvas.getContext('2d');
         resizeCanvas();
-        window.addEventListener('resize', resizeCanvas);
+        window.addEventListener('resize', () => { resizeCanvas(); offscreenDirty = true; });
         initAmbient();
 
         const badge = document.getElementById('team-badge');
@@ -328,11 +360,7 @@ function handlePhaseChange() {
         cd.style.display = '';
         const num = document.getElementById('countdown-number');
         const secs = Math.ceil(gameState.countdown);
-        if (secs <= 0) {
-            num.textContent = 'GO!';
-        } else {
-            num.textContent = secs;
-        }
+        num.textContent = secs <= 0 ? 'GO!' : secs;
         document.getElementById('gameover-overlay').style.display = 'none';
     } else {
         document.getElementById('countdown-overlay').style.display = 'none';
@@ -369,14 +397,17 @@ function detectDeaths() {
 function buildScoreHUD() {
     const container = document.getElementById('hud-left');
     container.innerHTML = '';
-    for (let i = 0; i < numTeams; i++) {
+    for (let i = 0; i < MAX_TEAMS_DISPLAY; i++) {
         const div = document.createElement('div');
         div.className = 'team-score';
+        div.id = `team-score-${i}`;
         div.style.color = TEAMS[i].pri;
         div.innerHTML = `<span class="team-icon">${TEAMS[i].icon}</span><span id="score-${i}">0</span>`;
         container.appendChild(div);
     }
 }
+
+const MAX_TEAMS_DISPLAY = 4;
 
 function resizeCanvas() {
     canvas.width = window.innerWidth;
@@ -386,6 +417,69 @@ function resizeCanvas() {
     scale = Math.min(scaleX, scaleY);
     offsetX = (canvas.width - MAP_W * scale) / 2;
     offsetY = (canvas.height - MAP_H * scale) / 2;
+    offscreenDirty = true;
+}
+
+// ─── Offscreen Canvas Pre-rendering ─────────────────────────────────────────
+
+function buildOffscreenCanvases() {
+    const w = Math.ceil(MAP_W * scale);
+    const h = Math.ceil(MAP_H * scale);
+
+    // Grid canvas
+    gridCanvas = document.createElement('canvas');
+    gridCanvas.width = w;
+    gridCanvas.height = h;
+    const gc = gridCanvas.getContext('2d');
+    gc.strokeStyle = COL.grid;
+    gc.lineWidth = 0.5;
+    const step = 60;
+    for (let x = 0; x <= MAP_W; x += step) {
+        gc.beginPath();
+        gc.moveTo(x * scale, 0);
+        gc.lineTo(x * scale, MAP_H * scale);
+        gc.stroke();
+    }
+    for (let y = 0; y <= MAP_H; y += step) {
+        gc.beginPath();
+        gc.moveTo(0, y * scale);
+        gc.lineTo(MAP_W * scale, y * scale);
+        gc.stroke();
+    }
+
+    // Wall canvas
+    wallCanvas = document.createElement('canvas');
+    wallCanvas.width = w;
+    wallCanvas.height = h;
+    const wc = wallCanvas.getContext('2d');
+    for (const wall of cachedWalls) {
+        const x = wall[0] * scale;
+        const y = wall[1] * scale;
+        const ww = wall[2] * scale;
+        const wh = wall[3] * scale;
+
+        // Shadow
+        wc.fillStyle = 'rgba(0,0,0,0.25)';
+        wc.fillRect(x + 2 * scale, y + 2 * scale, ww, wh);
+
+        // Wall body gradient
+        const grad = wc.createLinearGradient(x, y, x, y + wh);
+        grad.addColorStop(0, COL.wallTop);
+        grad.addColorStop(1, COL.wallFill);
+        wc.fillStyle = grad;
+        wc.fillRect(x, y, ww, wh);
+
+        // Top highlight
+        wc.fillStyle = 'rgba(100, 160, 255, 0.06)';
+        wc.fillRect(x, y, ww, Math.min(3 * scale, wh));
+
+        // Border
+        wc.strokeStyle = COL.wallStroke;
+        wc.lineWidth = 1;
+        wc.strokeRect(x + 0.5, y + 0.5, ww - 1, wh - 1);
+    }
+
+    offscreenDirty = false;
 }
 
 // ─── Input ──────────────────────────────────────────────────────────────────
@@ -396,6 +490,12 @@ document.addEventListener('keydown', (e) => {
         case 's': case 'arrowdown': keys.down = true; break;
         case 'a': case 'arrowleft': keys.left = true; break;
         case 'd': case 'arrowright': keys.right = true; break;
+        case 'g':
+            if (connected && ws) ws.send(JSON.stringify({ type: 'emote', emote: EMOTE_HAPPY }));
+            break;
+        case 'h':
+            if (connected && ws) ws.send(JSON.stringify({ type: 'emote', emote: EMOTE_SAD }));
+            break;
     }
 });
 
@@ -448,15 +548,18 @@ function formatTime(seconds) {
 function updateHUD() {
     if (!gameState) return;
 
-    // Update scores
-    for (let i = 0; i < numTeams; i++) {
+    // Update scores — only show teams with players
+    const thp = gameState.team_has_players || [1, 1, 0, 0];
+    for (let i = 0; i < MAX_TEAMS_DISPLAY; i++) {
         const el = document.getElementById(`score-${i}`);
+        const row = document.getElementById(`team-score-${i}`);
         if (el) el.textContent = gameState.scores[i];
+        if (row) row.style.display = thp[i] ? '' : 'none';
     }
+
     // Rebuild if team count changed
     if (gameState.num_teams && gameState.num_teams !== numTeams) {
         numTeams = gameState.num_teams;
-        buildScoreHUD();
     }
 
     // Timer
@@ -467,13 +570,9 @@ function updateHUD() {
         timerEl.className = 'hud-timer';
     } else {
         timerEl.textContent = formatTime(timer);
-        if (timer <= 10) {
-            timerEl.className = 'hud-timer critical';
-        } else if (timer <= 30) {
-            timerEl.className = 'hud-timer warning';
-        } else {
-            timerEl.className = 'hud-timer';
-        }
+        if (timer <= 10) timerEl.className = 'hud-timer critical';
+        else if (timer <= 30) timerEl.className = 'hud-timer warning';
+        else timerEl.className = 'hud-timer';
     }
 
     // Kills
@@ -516,19 +615,16 @@ function showGameOver() {
         winSub.textContent = (winnerTeam.name || 'Team ' + wt) + ' team wins!';
     }
 
-    // Win reason
     const reason = gameState.win_reason;
-    if (reason === 0) {
-        reasonEl.textContent = `Won by captures (${gameState.scores[wt]} flags)`;
-    } else if (reason === 1) {
-        reasonEl.textContent = `Won by kills (time expired)`;
-    } else {
-        reasonEl.textContent = '';
-    }
+    if (reason === 0) reasonEl.textContent = `Won by captures (${gameState.scores[wt]} flags)`;
+    else if (reason === 1) reasonEl.textContent = `Won by kills (time expired)`;
+    else reasonEl.textContent = '';
 
-    // Stats table
+    // Stats — only teams with players
+    const thp = gameState.team_has_players || [1, 1, 0, 0];
     let statsHtml = '';
-    for (let i = 0; i < numTeams; i++) {
+    for (let i = 0; i < MAX_TEAMS_DISPLAY; i++) {
+        if (!thp[i]) continue;
         const team = TEAMS[i];
         const isWinner = i === wt;
         statsHtml += `<div class="stats-row${isWinner ? ' stats-winner' : ''}">
@@ -558,7 +654,6 @@ function spawnExplosion(x, y, color, big) {
             size: big ? (2 + Math.random() * 4) : (1.5 + Math.random() * 2.5),
         });
     }
-    // Shockwave ring for big explosions
     if (big) {
         particles.push({
             x, y, vx: 0, vy: 0,
@@ -569,10 +664,7 @@ function spawnExplosion(x, y, color, big) {
 }
 
 function spawnMuzzleFlash(x, y, angle, color) {
-    muzzleFlashes.push({
-        x, y, angle, color,
-        life: 0.08,
-    });
+    muzzleFlashes.push({ x, y, angle, color, life: 0.08 });
     for (let i = 0; i < 4; i++) {
         const a2 = angle + (Math.random() - 0.5) * 0.6;
         particles.push({
@@ -653,22 +745,24 @@ function drawMuzzleFlashes() {
     ctx.globalAlpha = 1;
 }
 
-// ─── Bullet Trails ──────────────────────────────────────────────────────────
+// ─── Bullet Trails (ring buffer) ────────────────────────────────────────────
 
 function trackBulletTrails() {
     if (!gameState) return;
     for (const b of gameState.bullets) {
-        bulletTrails.push({ x: b.x, y: b.y, team: b.team, life: 0.2 });
+        const t = trailPool[trailHead];
+        t.x = b.x; t.y = b.y; t.team = b.team; t.life = 0.2;
+        trailHead = (trailHead + 1) % MAX_TRAILS;
     }
-    for (let i = bulletTrails.length - 1; i >= 0; i--) {
-        bulletTrails[i].life -= 1 / 60;
-        if (bulletTrails[i].life <= 0) bulletTrails.splice(i, 1);
+    for (const t of trailPool) {
+        if (t.life > 0) t.life -= 1 / 60;
     }
 }
 
 function drawBulletTrails() {
-    for (const t of bulletTrails) {
-        const alpha = Math.max(0, t.life / 0.2) * 0.35;
+    for (const t of trailPool) {
+        if (t.life <= 0) continue;
+        const alpha = (t.life / 0.2) * 0.35;
         ctx.globalAlpha = alpha;
         const team = TEAMS[t.team] || TEAMS[0];
         ctx.fillStyle = team.bullet;
@@ -682,7 +776,6 @@ function drawBulletTrails() {
 // ─── Rendering ──────────────────────────────────────────────────────────────
 
 let lastTime = performance.now();
-let prevBullets = [];
 
 function gameLoop(timestamp) {
     const dt = Math.min((timestamp - lastTime) / 1000, 0.05);
@@ -698,7 +791,6 @@ function gameLoop(timestamp) {
         const curBullets = gameState.bullets;
         const pBullets = prevState.bullets;
         if (curBullets.length > pBullets.length) {
-            // New bullets appeared
             for (let i = pBullets.length; i < curBullets.length; i++) {
                 const b = curBullets[i];
                 if (b) {
@@ -717,6 +809,9 @@ function gameLoop(timestamp) {
 function draw() {
     if (!gameState) return;
 
+    // Build offscreen canvases if dirty
+    if (offscreenDirty && cachedWalls.length > 0) buildOffscreenCanvases();
+
     ctx.save();
     ctx.translate(screenShake.x, screenShake.y);
 
@@ -724,10 +819,15 @@ function draw() {
     ctx.fillStyle = COL.bg;
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    drawGrid();
+    // Pre-rendered grid
+    if (gridCanvas) ctx.drawImage(gridCanvas, offsetX, offsetY);
+
     drawAmbient();
     drawBases();
-    drawWalls();
+
+    // Pre-rendered walls
+    if (wallCanvas) ctx.drawImage(wallCanvas, offsetX, offsetY);
+
     drawFlags();
     drawBulletTrails();
     drawBullets();
@@ -752,26 +852,6 @@ function drawAmbient() {
     ctx.globalAlpha = 1;
 }
 
-// ─── Grid ───────────────────────────────────────────────────────────────────
-
-function drawGrid() {
-    ctx.strokeStyle = COL.grid;
-    ctx.lineWidth = 0.5;
-    const step = 60;
-    for (let x = 0; x <= MAP_W; x += step) {
-        ctx.beginPath();
-        ctx.moveTo(x * scale + offsetX, offsetY);
-        ctx.lineTo(x * scale + offsetX, MAP_H * scale + offsetY);
-        ctx.stroke();
-    }
-    for (let y = 0; y <= MAP_H; y += step) {
-        ctx.beginPath();
-        ctx.moveTo(offsetX, y * scale + offsetY);
-        ctx.lineTo(MAP_W * scale + offsetX, y * scale + offsetY);
-        ctx.stroke();
-    }
-}
-
 // ─── Bases ──────────────────────────────────────────────────────────────────
 
 function drawBases() {
@@ -783,10 +863,8 @@ function drawBases() {
         const by = flag.by * scale + offsetY;
         const r = 55 * scale;
 
-        // Pulsing glow
         const pulse = 0.7 + 0.3 * Math.sin(time * 2 + i);
 
-        // Outer glow
         const grad = ctx.createRadialGradient(bx, by, 0, bx, by, r * 1.3);
         grad.addColorStop(0, team.base);
         grad.addColorStop(1, 'transparent');
@@ -796,7 +874,6 @@ function drawBases() {
         ctx.arc(bx, by, r * 1.3, 0, Math.PI * 2);
         ctx.fill();
 
-        // Base circle
         ctx.globalAlpha = pulse * 0.6;
         ctx.strokeStyle = team.baseStroke;
         ctx.lineWidth = 2 * scale;
@@ -807,37 +884,6 @@ function drawBases() {
         ctx.setLineDash([]);
 
         ctx.globalAlpha = 1;
-    }
-}
-
-// ─── Walls ──────────────────────────────────────────────────────────────────
-
-function drawWalls() {
-    for (const w of gameState.walls) {
-        const x = w[0] * scale + offsetX;
-        const y = w[1] * scale + offsetY;
-        const width = w[2] * scale;
-        const height = w[3] * scale;
-
-        // Shadow
-        ctx.fillStyle = 'rgba(0,0,0,0.25)';
-        ctx.fillRect(x + 2 * scale, y + 2 * scale, width, height);
-
-        // Wall body with gradient
-        const grad = ctx.createLinearGradient(x, y, x, y + height);
-        grad.addColorStop(0, COL.wallTop);
-        grad.addColorStop(1, COL.wallFill);
-        ctx.fillStyle = grad;
-        ctx.fillRect(x, y, width, height);
-
-        // Top highlight
-        ctx.fillStyle = 'rgba(100, 160, 255, 0.06)';
-        ctx.fillRect(x, y, width, Math.min(3 * scale, height));
-
-        // Border
-        ctx.strokeStyle = COL.wallStroke;
-        ctx.lineWidth = 1;
-        ctx.strokeRect(x + 0.5, y + 0.5, width - 1, height - 1);
     }
 }
 
@@ -853,7 +899,7 @@ function drawFlags() {
         const r = FLAG_RADIUS * scale;
         const team = TEAMS[flag.team] || TEAMS[0];
 
-        // Glow circle
+        // Glow
         const pulse = 0.6 + 0.4 * Math.sin(time * 3 + i * 1.5);
         ctx.globalAlpha = pulse * 0.3;
         const fg = ctx.createRadialGradient(fx, fy, 0, fx, fy, r * 2);
@@ -865,7 +911,7 @@ function drawFlags() {
         ctx.fill();
         ctx.globalAlpha = 1;
 
-        // Flag pole
+        // Pole
         ctx.strokeStyle = '#8899aa';
         ctx.lineWidth = 2.5 * scale;
         ctx.lineCap = 'round';
@@ -874,7 +920,7 @@ function drawFlags() {
         ctx.lineTo(fx, fy - r * 0.9);
         ctx.stroke();
 
-        // Flag triangle with gradient
+        // Flag triangle
         const flagGrad = ctx.createLinearGradient(fx, fy - r, fx + r * 1.2, fy);
         flagGrad.addColorStop(0, team.pri);
         flagGrad.addColorStop(1, team.dark);
@@ -885,8 +931,6 @@ function drawFlags() {
         ctx.lineTo(fx + 1 * scale, fy + r * 0.2);
         ctx.closePath();
         ctx.fill();
-
-        // Flag outline
         ctx.strokeStyle = 'rgba(255,255,255,0.3)';
         ctx.lineWidth = 1;
         ctx.stroke();
@@ -902,11 +946,9 @@ function drawBullets() {
         const r = 5 * scale;
         const team = TEAMS[b.team] || TEAMS[0];
 
-        // Outer glow
         ctx.shadowColor = team.bulletGlow;
         ctx.shadowBlur = 16 * scale;
 
-        // Bullet body with gradient
         const bg = ctx.createRadialGradient(bx, by, 0, bx, by, r);
         bg.addColorStop(0, '#ffffff');
         bg.addColorStop(0.3, team.bullet);
@@ -915,10 +957,8 @@ function drawBullets() {
         ctx.beginPath();
         ctx.arc(bx, by, r, 0, Math.PI * 2);
         ctx.fill();
-
         ctx.shadowBlur = 0;
 
-        // Bounce count indicator: fading opacity
         const fadeAlpha = 1.0 - (b.bounces / 6);
         if (fadeAlpha < 1) {
             ctx.globalAlpha = 0.3;
@@ -950,7 +990,6 @@ function drawTanks() {
             ctx.rotate(tank.angle);
             ctx.fillStyle = '#222';
             ctx.fillRect(-half, -half, half * 2, half * 2);
-            // Scorch marks
             ctx.fillStyle = 'rgba(80,40,0,0.4)';
             ctx.beginPath();
             ctx.arc(0, 0, half * 0.6, 0, Math.PI * 2);
@@ -971,7 +1010,7 @@ function drawTanks() {
         ctx.translate(tx, ty);
         ctx.rotate(tank.angle);
 
-        // Tracks with tread pattern
+        // Tracks
         ctx.fillStyle = team.dark;
         ctx.fillRect(-half * 1.05, -half, half * 2.1, half * 0.35);
         ctx.fillRect(-half * 1.05, half * 0.65, half * 2.1, half * 0.35);
@@ -982,26 +1021,18 @@ function drawTanks() {
         const treadOffset = (time * 60) % 6;
         for (let tx2 = -half; tx2 < half; tx2 += 6) {
             const xp = tx2 + treadOffset;
-            ctx.beginPath();
-            ctx.moveTo(xp, -half);
-            ctx.lineTo(xp, -half + half * 0.35);
-            ctx.stroke();
-            ctx.beginPath();
-            ctx.moveTo(xp, half * 0.65);
-            ctx.lineTo(xp, half);
-            ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(xp, -half); ctx.lineTo(xp, -half + half * 0.35); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(xp, half * 0.65); ctx.lineTo(xp, half); ctx.stroke();
         }
 
-        // Body with gradient
+        // Body gradient
         const bodyGrad = ctx.createLinearGradient(-half * 0.85, -half * 0.65, half * 0.85, half * 0.65);
         bodyGrad.addColorStop(0, team.pri);
         bodyGrad.addColorStop(0.5, team.dark);
         bodyGrad.addColorStop(1, team.pri);
         ctx.fillStyle = bodyGrad;
         ctx.beginPath();
-        // Rounded rectangle body
-        const bw = half * 1.7, bh = half * 1.3;
-        const br = 3 * scale;
+        const bw = half * 1.7, bh = half * 1.3, br = 3 * scale;
         ctx.moveTo(-bw / 2 + br, -bh / 2);
         ctx.lineTo(bw / 2 - br, -bh / 2);
         ctx.arcTo(bw / 2, -bh / 2, bw / 2, -bh / 2 + br, br);
@@ -1014,12 +1045,11 @@ function drawTanks() {
         ctx.closePath();
         ctx.fill();
 
-        // Body highlight line
         ctx.strokeStyle = 'rgba(255,255,255,0.15)';
         ctx.lineWidth = 1;
         ctx.stroke();
 
-        // Team emblem (small diamond)
+        // Team emblem
         ctx.fillStyle = 'rgba(255,255,255,0.2)';
         ctx.beginPath();
         ctx.moveTo(0, -half * 0.3);
@@ -1042,7 +1072,6 @@ function drawTanks() {
         barrelGrad.addColorStop(0.5, '#99a8c0');
         barrelGrad.addColorStop(1, '#dde4f0');
         ctx.fillStyle = barrelGrad;
-        // Rounded barrel
         ctx.beginPath();
         ctx.moveTo(half * 0.15, -half * 0.12);
         ctx.lineTo(half * 1.1, -half * 0.1);
@@ -1055,7 +1084,6 @@ function drawTanks() {
         ctx.lineWidth = 0.5;
         ctx.stroke();
 
-        // Barrel muzzle
         ctx.fillStyle = COL.turretTip;
         ctx.fillRect(half * 1.0, -half * 0.13, half * 0.18, half * 0.26);
 
@@ -1078,7 +1106,6 @@ function drawTanks() {
         // ── Flag carrier indicator ──
         if (tank.flag >= 0) {
             const flagTeam = TEAMS[tank.flag] || TEAMS[0];
-            // Orbiting flag icon
             const orbitAngle = time * 3;
             const ox = tx + Math.cos(orbitAngle) * (half + 6 * scale);
             const oy = ty + Math.sin(orbitAngle) * (half + 6 * scale) - 12 * scale;
@@ -1088,7 +1115,6 @@ function drawTanks() {
             ctx.arc(ox, oy, 5 * scale, 0, Math.PI * 2);
             ctx.fill();
             ctx.globalAlpha = 1;
-            // Flag text
             ctx.fillStyle = flagTeam.pri;
             ctx.font = `bold ${11 * scale}px sans-serif`;
             ctx.textAlign = 'center';
@@ -1107,10 +1133,53 @@ function drawTanks() {
             ctx.closePath();
             ctx.fill();
         }
+
+        // ── Emote bubble ──
+        if (tank.emote && tank.emote !== EMOTE_NONE && tank.emote_t > 0) {
+            const emoji = EMOTE_EMOJI[tank.emote] || '';
+            if (emoji) {
+                const fadeIn = Math.min(1, (EMOTE_DURATION - tank.emote_t + 0.3) / 0.3);
+                const fadeOut = Math.min(1, tank.emote_t / 0.5);
+                const alpha = fadeIn * fadeOut;
+                const bobY = Math.sin(time * 3) * 3 * scale;
+                const emoteY = ty - half - 32 * scale + bobY;
+
+                // Bubble background
+                ctx.globalAlpha = alpha * 0.85;
+                ctx.fillStyle = 'rgba(15, 22, 36, 0.9)';
+                ctx.strokeStyle = team.pri;
+                ctx.lineWidth = 1.5 * scale;
+                const bubbleR = 14 * scale;
+                ctx.beginPath();
+                ctx.arc(tx, emoteY, bubbleR, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.stroke();
+
+                // Bubble tail
+                ctx.fillStyle = 'rgba(15, 22, 36, 0.9)';
+                ctx.beginPath();
+                ctx.moveTo(tx - 4 * scale, emoteY + bubbleR - 2 * scale);
+                ctx.lineTo(tx, emoteY + bubbleR + 6 * scale);
+                ctx.lineTo(tx + 4 * scale, emoteY + bubbleR - 2 * scale);
+                ctx.closePath();
+                ctx.fill();
+
+                // Emoji
+                ctx.globalAlpha = alpha;
+                ctx.font = `${16 * scale}px sans-serif`;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillStyle = '#fff';
+                ctx.fillText(emoji, tx, emoteY);
+                ctx.textBaseline = 'alphabetic';
+                ctx.globalAlpha = 1;
+            }
+        }
     }
 }
 
 // Make globally accessible
+const EMOTE_DURATION = 3.0;
 window.connectToServer = connectToServer;
 window.startGame = startGame;
 window.restartGame = restartGame;
