@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tank CTF — Multiplayer</title>
+    <meta name="description"
+        content="Multiplayer 2D Tank Capture the Flag game. Play with friends on your local network!">
+    <link rel="stylesheet" href="style.css">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@400;600;700&display=swap"
+        rel="stylesheet">
+</head>
+
+<body>
+    <!-- ─── Connection Screen ─── -->
+    <div id="menu-screen">
+        <div class="menu-bg"></div>
+        <div class="menu-content">
+            <h1 class="game-title">TANK <span class="accent">CTF</span></h1>
+            <p class="subtitle">CAPTURE THE FLAG</p>
+            <div class="menu-card">
+                <div class="info-row">
+                    <span class="label">Mode</span>
+                    <span class="value">2–4 Team Arena</span>
+                </div>
+                <div class="info-row">
+                    <span class="label">Players</span>
+                    <span class="value">4–8 players</span>
+                </div>
+                <div class="info-row">
+                    <span class="label">Map</span>
+                    <span class="value">Corridor Maze</span>
+                </div>
+                <div class="info-row">
+                    <span class="label">Win</span>
+                    <span class="value">First to 3 captures</span>
+                </div>
+                <button id="join-btn" onclick="connectToServer()">
+                    <span class="btn-text">JOIN GAME</span>
+                    <span class="btn-glow"></span>
+                </button>
+                <div id="connection-status" class="status"></div>
+            </div>
+            <div class="controls-hint">
+                <div class="key-group">
+                    <span class="key">W</span><span class="key">A</span><span class="key">S</span><span
+                        class="key">D</span>
+                    <span class="key-label">Move</span>
+                </div>
+                <div class="key-group">
+                    <span class="key">🖱️</span>
+                    <span class="key-label">Aim</span>
+                </div>
+                <div class="key-group">
+                    <span class="key">Click</span>
+                    <span class="key-label">Shoot</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ─── Game Screen ─── -->
+    <div id="game-screen" style="display:none;">
+        <canvas id="game-canvas"></canvas>
+        <!-- HUD -->
+        <div id="hud">
+            <div id="hud-left">
+                <!-- Scores built dynamically by JS -->
+            </div>
+            <div id="hud-center">
+                <span id="team-badge"></span>
+            </div>
+            <div id="hud-right">
+                <span id="player-count">0 players</span>
+            </div>
+        </div>
+        <!-- Death overlay -->
+        <div id="death-overlay" style="display:none;">
+            <div class="death-text">DESTROYED</div>
+            <div class="death-sub">Respawning...</div>
+        </div>
+        <!-- Game over overlay -->
+        <div id="gameover-overlay" style="display:none;">
+            <div class="gameover-text" id="winner-text">VICTORY</div>
+            <div class="gameover-sub">Team wins!</div>
+        </div>
+    </div>
+
+    <script src="game.js"></script>
+</body>
+
+</html>
