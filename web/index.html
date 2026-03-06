@@ -61,6 +61,67 @@
         </div>
     </div>
 
+    <!-- ─── Lobby Screen ─── -->
+    <div id="lobby-screen" style="display:none;">
+        <div class="menu-bg"></div>
+        <div class="lobby-content">
+            <h1 class="game-title lobby-title">TANK <span class="accent">CTF</span></h1>
+            <p class="subtitle">GAME LOBBY</p>
+
+            <div class="lobby-columns">
+                <!-- Left: Player List -->
+                <div class="lobby-card">
+                    <div class="card-header">
+                        <span class="card-icon">👥</span> PLAYERS
+                        <span class="player-count-badge" id="lobby-player-count">0/8</span>
+                    </div>
+                    <div id="lobby-player-list" class="player-list">
+                        <div class="player-empty">Waiting for players...</div>
+                    </div>
+                    <div class="min-players-hint" id="min-players-hint">
+                        ⚠ Need at least 2 players to start
+                    </div>
+                </div>
+
+                <!-- Right: Settings -->
+                <div class="lobby-card">
+                    <div class="card-header">
+                        <span class="card-icon">⚙</span> SETTINGS
+                    </div>
+                    <div class="setting-row">
+                        <label class="setting-label" for="setting-bounces">Bullet Bounces</label>
+                        <div class="setting-control">
+                            <input type="range" id="setting-bounces" min="1" max="20" value="8" class="setting-slider">
+                            <span class="setting-value" id="bounces-value">8</span>
+                        </div>
+                    </div>
+                    <div class="setting-row">
+                        <label class="setting-label" for="setting-duration">Game Duration</label>
+                        <div class="setting-control">
+                            <select id="setting-duration" class="setting-select">
+                                <option value="0">Unlimited</option>
+                                <option value="120">2 Minutes</option>
+                                <option value="180" selected>3 Minutes</option>
+                                <option value="300">5 Minutes</option>
+                                <option value="600">10 Minutes</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="share-link-box">
+                        <span class="card-icon">🔗</span>
+                        <span class="share-label">Share Link</span>
+                        <code class="share-url" id="share-url">loading...</code>
+                    </div>
+                </div>
+            </div>
+
+            <button id="start-btn" onclick="startGame()" disabled>
+                <span class="btn-text">START GAME</span>
+                <span class="btn-glow"></span>
+            </button>
+        </div>
+    </div>
+
     <!-- ─── Game Screen ─── -->
     <div id="game-screen" style="display:none;">
         <canvas id="game-canvas"></canvas>
@@ -73,8 +134,17 @@
                 <span id="team-badge"></span>
             </div>
             <div id="hud-right">
-                <span id="player-count">0 players</span>
+                <div id="hud-timer" class="hud-timer">∞</div>
+                <div class="hud-stats">
+                    <span id="hud-kills" class="hud-kills">0 kills</span>
+                    <span class="hud-sep">·</span>
+                    <span id="player-count">0 players</span>
+                </div>
             </div>
+        </div>
+        <!-- Countdown overlay -->
+        <div id="countdown-overlay" style="display:none;">
+            <div class="countdown-number" id="countdown-number">3</div>
         </div>
         <!-- Death overlay -->
         <div id="death-overlay" style="display:none;">
@@ -83,8 +153,16 @@
         </div>
         <!-- Game over overlay -->
         <div id="gameover-overlay" style="display:none;">
-            <div class="gameover-text" id="winner-text">VICTORY</div>
-            <div class="gameover-sub">Team wins!</div>
+            <div class="gameover-card">
+                <div class="gameover-text" id="winner-text">VICTORY</div>
+                <div class="gameover-sub" id="gameover-sub">Team wins!</div>
+                <div class="gameover-reason" id="gameover-reason"></div>
+                <div class="gameover-stats" id="gameover-stats"></div>
+                <button id="restart-btn" onclick="restartGame()">
+                    <span class="btn-text">PLAY AGAIN</span>
+                    <span class="btn-glow"></span>
+                </button>
+            </div>
         </div>
     </div>
 

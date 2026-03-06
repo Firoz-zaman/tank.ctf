@@ -1,8 +1,10 @@
 /**
- * Tank CTF — Web Game Client (v2 — 4-Team, Premium Graphics)
+ * Tank CTF — Web Game Client (v3 — Lobby, Game Flow, Timer, Kills)
  *
  * Connects to the Python WebSocket server, captures input,
  * renders the game on HTML5 Canvas with neon/glassmorphism aesthetic.
+ *
+ * Game flow: Menu → Connect → Lobby → Countdown → Playing → Game Over → Lobby
  */
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -11,6 +13,11 @@ const MAP_W = 1200;
 const MAP_H = 900;
 const TANK_SIZE = 24;
 const FLAG_RADIUS = 24;
+
+const PHASE_LOBBY = 0;
+const PHASE_COUNTDOWN = 1;
+const PHASE_PLAYING = 2;
+const PHASE_GAMEOVER = 3;
 
 // 4-team color palette
 const TEAMS = [
@@ -40,6 +47,9 @@ let numTeams = 2;
 let gameState = null;
 let prevState = null;
 let connected = false;
+let serverIp = '';
+let serverPort = 8080;
+let currentPhase = -1;  // Track phase transitions
 
 // Input
 const keys = { up: false, down: false, left: false, right: false };
@@ -119,13 +129,15 @@ function connectToServer() {
             myId = msg.id;
             myTeam = msg.team;
             numTeams = msg.num_teams || 2;
+            serverIp = msg.server_ip || window.location.hostname;
+            serverPort = msg.port || 8080;
             connected = true;
-            showGameScreen();
+            showLobby();
         } else if (msg.type === 'state') {
             prevState = gameState;
             gameState = msg.data;
             if (gameState.num_teams) numTeams = gameState.num_teams;
-            updateHUD();
+            handlePhaseChange();
             detectDeaths();
         } else if (msg.error) {
             statusEl.textContent = 'Error: ' + msg.error;
@@ -137,18 +149,206 @@ function connectToServer() {
     ws.onclose = () => {
         if (connected) {
             connected = false;
-            document.getElementById('game-screen').style.display = 'none';
-            document.getElementById('menu-screen').style.display = '';
+            showScreen('menu');
+            const statusEl = document.getElementById('connection-status');
             statusEl.textContent = 'Disconnected.';
             statusEl.className = 'status error';
-            btnEl.disabled = false;
+            document.getElementById('join-btn').disabled = false;
         } else {
+            const statusEl = document.getElementById('connection-status');
             statusEl.textContent = 'Could not connect. Is the server running?';
             statusEl.className = 'status error';
-            btnEl.disabled = false;
+            document.getElementById('join-btn').disabled = false;
         }
     };
-    ws.onerror = () => { statusEl.textContent = 'Connection error.'; statusEl.className = 'status error'; btnEl.disabled = false; };
+    ws.onerror = () => {
+        const statusEl = document.getElementById('connection-status');
+        statusEl.textContent = 'Connection error.';
+        statusEl.className = 'status error';
+        document.getElementById('join-btn').disabled = false;
+    };
+}
+
+// ─── Screen Management ──────────────────────────────────────────────────────
+
+function showScreen(name) {
+    document.getElementById('menu-screen').style.display = (name === 'menu') ? '' : 'none';
+    document.getElementById('lobby-screen').style.display = (name === 'lobby') ? '' : 'none';
+    document.getElementById('game-screen').style.display = (name === 'game') ? '' : 'none';
+}
+
+// ─── Lobby ──────────────────────────────────────────────────────────────────
+
+let lobbyInitialized = false;
+
+function showLobby() {
+    showScreen('lobby');
+
+    // Set share URL
+    document.getElementById('share-url').textContent = `http://${serverIp}:${serverPort}`;
+
+    // Wire up settings
+    if (!lobbyInitialized) {
+        const bouncesSlider = document.getElementById('setting-bounces');
+        const bouncesValue = document.getElementById('bounces-value');
+        bouncesSlider.addEventListener('input', () => {
+            bouncesValue.textContent = bouncesSlider.value;
+            sendConfig();
+        });
+
+        const durationSelect = document.getElementById('setting-duration');
+        durationSelect.addEventListener('change', () => {
+            sendConfig();
+        });
+
+        lobbyInitialized = true;
+    }
+}
+
+function sendConfig() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const bounces = parseInt(document.getElementById('setting-bounces').value);
+    const duration = parseFloat(document.getElementById('setting-duration').value);
+    ws.send(JSON.stringify({ type: 'config', bounces, duration }));
+}
+
+function startGame() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: 'start' }));
+}
+
+function restartGame() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: 'restart' }));
+}
+
+function updateLobby() {
+    if (!gameState) return;
+
+    const playerList = document.getElementById('lobby-player-list');
+    const tanks = gameState.tanks || [];
+
+    if (tanks.length === 0) {
+        playerList.innerHTML = '<div class="player-empty">Waiting for players...</div>';
+    } else {
+        let html = '';
+        for (const t of tanks) {
+            const team = TEAMS[t.team] || TEAMS[0];
+            const isMe = t.id === myId;
+            html += `<div class="player-item${isMe ? ' is-me' : ''}">
+                <span class="player-dot" style="background:${team.pri}"></span>
+                <span class="player-name" style="color:${team.pri}">${team.name} Tank #${t.id}</span>
+                ${isMe ? '<span class="player-you">YOU</span>' : ''}
+            </div>`;
+        }
+        playerList.innerHTML = html;
+    }
+
+    // Update player count
+    const count = gameState.player_count || tanks.length;
+    document.getElementById('lobby-player-count').textContent = `${count}/8`;
+
+    // Update min players hint
+    const hintEl = document.getElementById('min-players-hint');
+    const startBtn = document.getElementById('start-btn');
+    if (count >= 2) {
+        hintEl.textContent = '✓ Ready to start!';
+        hintEl.className = 'min-players-hint ready';
+        startBtn.disabled = false;
+    } else {
+        hintEl.textContent = '⚠ Need at least 2 players to start';
+        hintEl.className = 'min-players-hint';
+        startBtn.disabled = true;
+    }
+
+    // Sync settings from server state
+    if (gameState.max_bounces !== undefined) {
+        const slider = document.getElementById('setting-bounces');
+        const valEl = document.getElementById('bounces-value');
+        slider.value = gameState.max_bounces;
+        valEl.textContent = gameState.max_bounces;
+    }
+    if (gameState.duration !== undefined) {
+        const select = document.getElementById('setting-duration');
+        const dur = gameState.duration;
+        // Find closest option
+        for (const opt of select.options) {
+            if (parseFloat(opt.value) === dur) {
+                select.value = opt.value;
+                break;
+            }
+        }
+    }
+}
+
+// ─── Phase Handling ─────────────────────────────────────────────────────────
+
+let canvasReady = false;
+
+function handlePhaseChange() {
+    if (!gameState) return;
+    const phase = gameState.phase;
+
+    if (phase === PHASE_LOBBY) {
+        // Show lobby
+        if (currentPhase !== PHASE_LOBBY) {
+            showLobby();
+            document.getElementById('gameover-overlay').style.display = 'none';
+            document.getElementById('countdown-overlay').style.display = 'none';
+        }
+        updateLobby();
+        currentPhase = phase;
+        return;
+    }
+
+    // For all non-lobby phases, show game screen
+    if (!canvasReady) {
+        showScreen('game');
+        canvas = document.getElementById('game-canvas');
+        ctx = canvas.getContext('2d');
+        resizeCanvas();
+        window.addEventListener('resize', resizeCanvas);
+        initAmbient();
+
+        const badge = document.getElementById('team-badge');
+        const team = TEAMS[myTeam];
+        badge.textContent = team.icon + ' ' + team.name.toUpperCase() + ' TEAM';
+        badge.style.color = team.pri;
+
+        buildScoreHUD();
+        requestAnimationFrame(gameLoop);
+        setInterval(sendInput, 1000 / 60);
+        canvasReady = true;
+    } else if (currentPhase === PHASE_LOBBY) {
+        showScreen('game');
+    }
+
+    if (phase === PHASE_COUNTDOWN) {
+        const cd = document.getElementById('countdown-overlay');
+        cd.style.display = '';
+        const num = document.getElementById('countdown-number');
+        const secs = Math.ceil(gameState.countdown);
+        if (secs <= 0) {
+            num.textContent = 'GO!';
+        } else {
+            num.textContent = secs;
+        }
+        document.getElementById('gameover-overlay').style.display = 'none';
+    } else {
+        document.getElementById('countdown-overlay').style.display = 'none';
+    }
+
+    if (phase === PHASE_PLAYING) {
+        document.getElementById('gameover-overlay').style.display = 'none';
+        updateHUD();
+    }
+
+    if (phase === PHASE_GAMEOVER) {
+        updateHUD();
+        showGameOver();
+    }
+
+    currentPhase = phase;
 }
 
 // ─── Detect deaths for explosion effects ────────────────────────────────────
@@ -165,28 +365,6 @@ function detectDeaths() {
 }
 
 // ─── Show Game Screen ───────────────────────────────────────────────────────
-
-function showGameScreen() {
-    document.getElementById('menu-screen').style.display = 'none';
-    document.getElementById('game-screen').style.display = '';
-
-    canvas = document.getElementById('game-canvas');
-    ctx = canvas.getContext('2d');
-
-    resizeCanvas();
-    window.addEventListener('resize', resizeCanvas);
-    initAmbient();
-
-    const badge = document.getElementById('team-badge');
-    const team = TEAMS[myTeam];
-    badge.textContent = team.icon + ' ' + team.name.toUpperCase() + ' TEAM';
-    badge.style.color = team.pri;
-
-    buildScoreHUD();
-
-    requestAnimationFrame(gameLoop);
-    setInterval(sendInput, 1000 / 60);
-}
 
 function buildScoreHUD() {
     const container = document.getElementById('hud-left');
@@ -245,6 +423,7 @@ function getTurretAngle() {
 
 function sendInput() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!gameState || gameState.phase !== PHASE_PLAYING) return;
     ws.send(JSON.stringify({
         type: 'input',
         up: keys.up ? 1 : 0,
@@ -258,6 +437,13 @@ function sendInput() {
 }
 
 // ─── HUD ────────────────────────────────────────────────────────────────────
+
+function formatTime(seconds) {
+    if (seconds < 0) return '∞';
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return `${m}:${s.toString().padStart(2, '0')}`;
+}
 
 function updateHUD() {
     if (!gameState) return;
@@ -273,31 +459,86 @@ function updateHUD() {
         buildScoreHUD();
     }
 
+    // Timer
+    const timerEl = document.getElementById('hud-timer');
+    const timer = gameState.timer;
+    if (timer < 0) {
+        timerEl.textContent = '∞';
+        timerEl.className = 'hud-timer';
+    } else {
+        timerEl.textContent = formatTime(timer);
+        if (timer <= 10) {
+            timerEl.className = 'hud-timer critical';
+        } else if (timer <= 30) {
+            timerEl.className = 'hud-timer warning';
+        } else {
+            timerEl.className = 'hud-timer';
+        }
+    }
+
+    // Kills
+    const myTank = gameState.tanks.find(t => t.id === myId);
+    const killsEl = document.getElementById('hud-kills');
+    if (myTank) {
+        killsEl.textContent = myTank.kills + ' kill' + (myTank.kills !== 1 ? 's' : '');
+    }
+
+    // Player count
     document.getElementById('player-count').textContent = gameState.tanks.length + ' player' + (gameState.tanks.length !== 1 ? 's' : '');
 
     // Death overlay
-    const myTank = gameState.tanks.find(t => t.id === myId);
     document.getElementById('death-overlay').style.display = (myTank && !myTank.alive) ? '' : 'none';
+}
 
-    // Game over
+// ─── Game Over ──────────────────────────────────────────────────────────────
+
+function showGameOver() {
+    if (!gameState) return;
+
     const goEl = document.getElementById('gameover-overlay');
-    if (gameState.game_over) {
-        goEl.style.display = '';
-        const winText = document.getElementById('winner-text');
-        const winSub = document.querySelector('.gameover-sub');
-        const wt = gameState.winner;
-        if (wt === myTeam) {
-            winText.textContent = 'VICTORY';
-            winText.style.color = '#00f0ff';
-            winSub.textContent = 'Your team wins!';
-        } else {
-            winText.textContent = 'DEFEAT';
-            winText.style.color = '#ff3b5c';
-            winSub.textContent = (TEAMS[wt]?.name || 'Team ' + wt) + ' team wins.';
-        }
+    goEl.style.display = '';
+
+    const winText = document.getElementById('winner-text');
+    const winSub = document.getElementById('gameover-sub');
+    const reasonEl = document.getElementById('gameover-reason');
+    const statsEl = document.getElementById('gameover-stats');
+
+    const wt = gameState.winner;
+    const winnerTeam = TEAMS[wt] || TEAMS[0];
+
+    if (wt === myTeam) {
+        winText.textContent = 'VICTORY';
+        winText.style.color = '#00f0ff';
+        winSub.textContent = 'Your team wins!';
     } else {
-        goEl.style.display = 'none';
+        winText.textContent = 'DEFEAT';
+        winText.style.color = '#ff3b5c';
+        winSub.textContent = (winnerTeam.name || 'Team ' + wt) + ' team wins!';
     }
+
+    // Win reason
+    const reason = gameState.win_reason;
+    if (reason === 0) {
+        reasonEl.textContent = `Won by captures (${gameState.scores[wt]} flags)`;
+    } else if (reason === 1) {
+        reasonEl.textContent = `Won by kills (time expired)`;
+    } else {
+        reasonEl.textContent = '';
+    }
+
+    // Stats table
+    let statsHtml = '';
+    for (let i = 0; i < numTeams; i++) {
+        const team = TEAMS[i];
+        const isWinner = i === wt;
+        statsHtml += `<div class="stats-row${isWinner ? ' stats-winner' : ''}">
+            <span class="stats-team-dot" style="background:${team.pri}"></span>
+            <span class="stats-team-name" style="color:${team.pri}">${team.name}</span>
+            <span class="stats-team-score" style="color:${team.pri}">${gameState.scores[i]} ⚑</span>
+            <span class="stats-team-kills">${gameState.team_kills[i]} kills</span>
+        </div>`;
+    }
+    statsEl.innerHTML = statsHtml;
 }
 
 // ─── Particle Systems ───────────────────────────────────────────────────────
@@ -871,3 +1112,5 @@ function drawTanks() {
 
 // Make globally accessible
 window.connectToServer = connectToServer;
+window.startGame = startGame;
+window.restartGame = restartGame;
